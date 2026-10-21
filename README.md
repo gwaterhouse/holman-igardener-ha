@@ -11,6 +11,12 @@ It provides a single `light` entity with on/off, RGB colour and brightness.
 > "Holman" and "iGardener" are trademarks of their respective owners and are
 > used here only to identify compatible hardware. Use at your own risk.
 
+> **Tested on one controller only.** So far this has only been tested on a
+> single controller. The fixed session frame sent during connection setup may
+> be device-specific, so it may not work on yours. Please
+> [open an issue](https://github.com/gwaterhouse/holman-igardener-ha/issues)
+> with your results, whether it works or not.
+
 ## Supported hardware
 
 - Holman iGardener RGB light controllers that advertise as `Vibrance_RGB`
