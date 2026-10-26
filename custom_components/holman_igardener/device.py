@@ -102,6 +102,8 @@ class HolmanDevice:
         self._keepalive_task: asyncio.Task | None = None
         self._watchdog_task: asyncio.Task | None = None
         self._stale_task: asyncio.Task | None = None
+        self._command_task: asyncio.Task | None = None
+        self._connect_task: asyncio.Task | None = None
         self._unsub_adv = None
         self._unsub_stop = None
 
@@ -209,19 +211,9 @@ class HolmanDevice:
         # on the client we held, or by the proxy when its API session ends.
         await self._release_proxy_slot()
         try:
-            client = await asyncio.wait_for(
-                establish_connection(
-                    BleakClientWithServiceCache,
-                    device,
-                    self.address,
-                    disconnected_callback=self._on_disconnect,
-                    max_attempts=CONNECT_ATTEMPTS,
-                ),
-                timeout=CONNECT_BUDGET_S,
-            )
-        except TimeoutError as exc:
-            await self._release_proxy_slot()
-            raise RuntimeError(f"{self.address}: connect timed out") from exc
+            client = await self._dial(device)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             await self._release_proxy_slot()
             raise
@@ -252,9 +244,60 @@ class HolmanDevice:
         except Exception:
             await self._abandon(client)
             raise
+        if self._stopping:
+            await self._abandon(client)
+            raise RuntimeError(f"{self.address}: integration is stopping")
         _LOGGER.debug("Holman %s: link up + init in %.1fs", self.address,
                       time.monotonic() - t0)
         return client
+
+    async def _dial(self, device):
+        """Run establish_connection without cancelling it.
+
+        bleak-retry-connector builds the client internally and returns it
+        only after connect() succeeds. Cancelling that task drops the
+        client while is_connected is still true, so the ESPHome proxy slot
+        stays taken. max_attempts limits timeouts and connect errors only;
+        ESPHome out-of-slot errors keep retrying inside the library.
+        A deadline or a stop waits for the call to finish, then disconnects
+        any client it returned.
+        """
+        task = asyncio.create_task(
+            establish_connection(
+                BleakClientWithServiceCache,
+                device,
+                self.address,
+                disconnected_callback=self._on_disconnect,
+                max_attempts=CONNECT_ATTEMPTS,
+            ),
+            name=f"holman_dial_{self.address}",
+        )
+        self._connect_task = task
+        try:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(task), timeout=CONNECT_BUDGET_S
+                )
+            except TimeoutError as exc:
+                await self._disconnect_client(await self._take_connect_result(task))
+                raise RuntimeError(f"{self.address}: connect timed out") from exc
+            except asyncio.CancelledError:
+                await self._disconnect_client(await self._take_connect_result(task))
+                raise
+        finally:
+            if self._connect_task is task:
+                self._connect_task = None
+
+    async def _take_connect_result(self, task):
+        """Await a dial that must not be cancelled. Return its client, or None."""
+        current = asyncio.current_task()
+        if current is not None:
+            while current.cancelling():
+                current.uncancel()
+        try:
+            return await task
+        except Exception:
+            return None
 
     async def _disconnect_client(self, client) -> None:
         if client is None:
@@ -398,6 +441,9 @@ class HolmanDevice:
                 if not self._stopping:
                     self._note_failure(exc)
                 raise
+            if self._stopping:
+                await self._abandon(client)
+                raise RuntimeError(f"{self.address}: integration is stopping")
             if PERSISTENT:
                 self._client = client
                 self._note_success()
@@ -514,6 +560,8 @@ class HolmanDevice:
                     except AttemptDeferred:
                         pass
                     except Exception as exc:
+                        if self._stopping:
+                            return
                         self._note_failure(exc)
                         continue
                     else:
@@ -591,47 +639,84 @@ class HolmanDevice:
                     unsub()
                 except Exception as exc:
                     _LOGGER.debug("Holman %s: unsubscribe failed: %s", self.address, exc)
-            tasks = (
+            for task in (
                 self._keepalive_task,
                 self._watchdog_task,
-                self._reconnect_task,
                 self._stale_task,
-            )
-            for task in tasks:
-                if task is not None and not task.done():
-                    task.cancel()
-            for task in tasks:
+            ):
                 await self._cancel_task(task)
+            # These two own an in-flight dial. Cancelling them must not
+            # cancel establish_connection; they disconnect whatever it returns
+            # before they finish. Wait that out. A short timeout here is how
+            # a live proxy slot was being dropped.
+            await self._await_cancelled(self._reconnect_task)
+            await self._await_cancelled(self._command_task)
+            connect_task = self._connect_task
+            if connect_task is not None:
+                await self._disconnect_client(
+                    await self._take_connect_result(connect_task)
+                )
+                if self._connect_task is connect_task:
+                    self._connect_task = None
+            client = None
             try:
-                await asyncio.wait_for(self._lock.acquire(), DISCONNECT_TIMEOUT_S)
+                async with asyncio.timeout(DISCONNECT_TIMEOUT_S):
+                    async with self._lock:
+                        client = self._client
+                        self._client = None
             except TimeoutError:
+                # Another coroutine still holds the lock and the client.
+                # Do not clear self._client out from under it. That coroutine
+                # sees _stopping and disconnects before it stores the client.
                 _LOGGER.warning(
-                    "Holman %s: timed out waiting to stop; disconnecting anyway",
+                    "Holman %s: stop timed out waiting for the BLE lock",
                     self.address,
                 )
-                client = self._client
-                self._client = None
-            else:
-                try:
-                    client = self._client
-                    self._client = None
-                finally:
-                    self._lock.release()
             await self._disconnect_client(client)
             _LOGGER.info("Holman %s: disconnected", self.address)
         finally:
             self._stop_wait.set()
+
+    async def _await_cancelled(self, task) -> None:
+        """Cancel task and wait until it has finished, including a shielded dial."""
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+        except Exception:
+            _LOGGER.debug("Holman %s: task ended during stop", self.address)
+
+    def _bind_command(self) -> None:
+        self._command_task = asyncio.current_task()
+
+    def _unbind_command(self) -> None:
+        if self._command_task is asyncio.current_task():
+            self._command_task = None
 
     async def turn_on(self, rgb=None, level=None):
         if rgb is not None:
             self.rgb = tuple(rgb)
         if level is not None:
             self.level = int(level)
-        async with self._lock:
-            await self._send([control_frame(self.rgb, self.level)])
-        self.on = True
+        self._bind_command()
+        try:
+            async with self._lock:
+                await self._send([control_frame(self.rgb, self.level)])
+            self.on = True
+        finally:
+            self._unbind_command()
 
     async def turn_off(self):
-        async with self._lock:
-            await self._send([off_frame()])
-        self.on = False
+        self._bind_command()
+        try:
+            async with self._lock:
+                await self._send([off_frame()])
+            self.on = False
+        finally:
+            self._unbind_command()

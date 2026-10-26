@@ -381,3 +381,162 @@ def test_one_connection_after_the_startup_delay(monkeypatch):
             await dev.async_stop()
 
     asyncio.run(_body())
+
+
+def _allow_dial(dev, monkeypatch, establish):
+    monkeypatch.setattr(device_mod, "establish_connection", establish)
+
+    async def _allow(self):
+        return None
+
+    dev._ensure_can_attempt = _allow.__get__(dev, HolmanDevice)
+    dev._best_device = lambda: object()
+
+
+def test_connect_budget_disconnects_and_does_not_store(monkeypatch):
+    """A dial that outlives the budget must not be cancelled or kept."""
+    monkeypatch.setattr(device_mod, "STARTUP_DELAY_S", 0)
+    monkeypatch.setattr(device_mod, "CONNECT_BUDGET_S", 0.05)
+    cancelled = []
+    held = []
+
+    async def _establish(*_args, **_kwargs):
+        try:
+            await asyncio.sleep(0.2)
+        except asyncio.CancelledError:
+            cancelled.append(1)
+            raise
+        client = FakeClient()
+        held.append(client)
+        return client
+
+    async def _body():
+        _hass, dev = _device()
+        _allow_dial(dev, monkeypatch, _establish)
+        try:
+            dev.async_start()
+            for _ in range(40):
+                if held and held[0].disconnects:
+                    break
+                await asyncio.sleep(0.02)
+            assert cancelled == []
+            assert held[0].disconnects == 1
+            assert held[0].is_connected is False
+            assert dev._client is None
+            assert dev._failure_count == 1
+        finally:
+            await dev.async_stop()
+
+    asyncio.run(_body())
+
+
+def test_stop_during_dial_disconnects_and_does_not_store(monkeypatch):
+    """Cancelling the reconnect task must still disconnect the dial's client."""
+    monkeypatch.setattr(device_mod, "STARTUP_DELAY_S", 0)
+    cancelled = []
+    held = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _establish(*_args, **_kwargs):
+        started.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.append(1)
+            raise
+        client = FakeClient()
+        held.append(client)
+        return client
+
+    async def _body():
+        _hass, dev = _device()
+        _allow_dial(dev, monkeypatch, _establish)
+        try:
+            dev.async_start()
+            await asyncio.wait_for(started.wait(), 2)
+            stop = asyncio.create_task(dev.async_stop())
+            for _ in range(50):
+                if dev._stopping:
+                    break
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.02)
+            release.set()
+            await asyncio.wait_for(stop, 2)
+            assert cancelled == []
+            assert held[0].disconnects == 1
+            assert held[0].is_connected is False
+            assert dev._client is None
+        finally:
+            release.set()
+            if not dev._stopping:
+                await dev.async_stop()
+
+    asyncio.run(_body())
+
+
+def test_turn_on_dial_outliving_stop_is_not_kept(monkeypatch):
+    """Stop must not return a stored client when turn_on is still dialing."""
+    monkeypatch.setattr(device_mod, "STARTUP_DELAY_S", 0)
+    monkeypatch.setattr(device_mod, "DISCONNECT_TIMEOUT_S", 0.05)
+    cancelled = []
+    held = []
+    started = asyncio.Event()
+
+    async def _establish(*_args, **_kwargs):
+        started.set()
+        try:
+            await asyncio.sleep(0.4)
+        except asyncio.CancelledError:
+            cancelled.append(1)
+            raise
+        client = FakeClient()
+        held.append(client)
+        return client
+
+    async def _body():
+        _hass, dev = _device()
+        _allow_dial(dev, monkeypatch, _establish)
+        turn = asyncio.create_task(dev.turn_on())
+        try:
+            await asyncio.wait_for(started.wait(), 2)
+            await asyncio.wait_for(dev.async_stop(), 2)
+            if not turn.done():
+                try:
+                    await asyncio.wait_for(turn, 2)
+                except asyncio.CancelledError:
+                    pass
+            else:
+                try:
+                    turn.result()
+                except asyncio.CancelledError:
+                    pass
+            assert cancelled == []
+            assert held[0].disconnects == 1
+            assert held[0].is_connected is False
+            assert dev._client is None
+            assert dev.on is False
+        finally:
+            if not turn.done():
+                turn.cancel()
+            if not dev._stopping:
+                await dev.async_stop()
+
+    asyncio.run(_body())
+
+
+def test_remove_entry_deletes_the_persistent_repair(monkeypatch):
+    _created, deleted = _issues(monkeypatch)
+
+    async def _body():
+        from custom_components.holman_igardener import async_remove_entry
+
+        hass = FakeHass()
+        entry = SimpleNamespace(data={"address": ADDRESS})
+        await async_remove_entry(hass, entry)
+        assert len(deleted) == 1
+        args, _kwargs = deleted[0]
+        assert args[1] == "holman_igardener"
+        assert args[2] == "unreachable_c56ad4a14a88"
+
+    asyncio.run(_body())

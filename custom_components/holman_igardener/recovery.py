@@ -17,7 +17,9 @@ BACKOFF_STEPS_S = (30.0, 60.0, 120.0, 180.0)
 UNREACHABLE_REPAIR_S = 15 * 60.0
 GATT_OP_TIMEOUT_S = 20.0
 DISCONNECT_TIMEOUT_S = 10.0
-# Outer bound around bleak-retry-connector's own retries.
+# After this long, do not use the client establish_connection returns.
+# The call itself is not cancelled: cancelling it can leave an ESPHome
+# proxy slot held. max_attempts does not limit those transient errors.
 CONNECT_BUDGET_S = 90.0
 WATCHDOG_INTERVAL_S = 60.0
 # Advertisements already in flight when the link comes up are not proof
