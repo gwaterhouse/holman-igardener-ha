@@ -104,6 +104,10 @@ class HolmanDevice:
         self._stale_task: asyncio.Task | None = None
         self._command_task: asyncio.Task | None = None
         self._connect_task: asyncio.Task | None = None
+        # In-flight client.disconnect() tasks, keyed by id(client). One close
+        # per client so a stop snapshot and the owner cannot both call it.
+        self._disconnect_tasks: dict[int, asyncio.Task] = {}
+        self._disconnecting: set[int] = set()
         self._unsub_adv = None
         self._unsub_stop = None
 
@@ -115,7 +119,11 @@ class HolmanDevice:
 
     def _live_client(self):
         client = self._client
-        if client is not None and getattr(client, "is_connected", False):
+        if (
+            client is not None
+            and id(client) not in self._disconnecting
+            and getattr(client, "is_connected", False)
+        ):
             return client
         return None
 
@@ -181,8 +189,10 @@ class HolmanDevice:
             self.hass, self.address, connectable=True)
 
     def _on_disconnect(self, client) -> None:
-        # Ignore disconnects we initiated: the caller already cleared
-        # self._client and decides whether to reconnect.
+        # A close we started keeps self._client until that wait finishes.
+        # The caller decides whether to reconnect.
+        if id(client) in self._disconnecting:
+            return
         if self._client is not client or self._stopping:
             if self._client is client:
                 self._client = None
@@ -239,7 +249,7 @@ class HolmanDevice:
             for frame in frames:
                 await self._write(client, frame)
         except asyncio.CancelledError:
-            await self._disconnect_client(client)
+            await self._close_local(client)
             raise
         except Exception:
             await self._abandon(client)
@@ -262,6 +272,10 @@ class HolmanDevice:
         A deadline or a stop waits for the call to finish, then disconnects
         any client it returned. The wait after the deadline is shielded too:
         a bare await is what cancels the dial when shutdown lands there.
+        The client exists only inside that task until it returns. After it
+        returns, the only reference is local until _disconnect_client or the
+        caller stores it. The close itself is shielded, and _connect_task is
+        cleared only after that wait.
         """
         task = asyncio.create_task(
             establish_connection(
@@ -286,7 +300,7 @@ class HolmanDevice:
                 await self._disconnect_client(await self._take_connect_result(task))
                 raise
         finally:
-            # Drop the handle only after the handlers above have disconnected.
+            # The handlers above have already finished their disconnect wait.
             if self._connect_task is task:
                 self._connect_task = None
 
@@ -314,13 +328,141 @@ class HolmanDevice:
         except (asyncio.CancelledError, Exception):
             return None
 
+    def _absorb_cancel(self) -> bool:
+        """Clear pending cancellation so the next await can run.
+
+        Returns True when this task was being cancelled. Python 3.11+
+        re-raises CancelledError at the next await unless the count is
+        brought back to zero.
+        """
+        current = asyncio.current_task()
+        if current is None or not current.cancelling():
+            return False
+        while current.cancelling():
+            current.uncancel()
+        return True
+
+    def _track_disconnect(self, client) -> asyncio.Task | None:
+        """Start one disconnect() for this client, or join the one in flight."""
+        if getattr(client, "_holman_closed", False):
+            return None
+        key = id(client)
+        # Mark before the first await so a cancel cannot land with no task
+        # stored and no self._client entry left to close.
+        self._disconnecting.add(key)
+        existing = self._disconnect_tasks.get(key)
+        if existing is not None and not existing.done():
+            return existing
+        task = asyncio.create_task(
+            self._invoke_disconnect(client),
+            name=f"holman_disc_{self.address}",
+        )
+        self._disconnect_tasks[key] = task
+        return task
+
+    async def _invoke_disconnect(self, client) -> None:
+        key = id(client)
+        cancelled = False
+        try:
+            await client.disconnect()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except Exception as exc:
+            _LOGGER.debug("Holman %s: disconnect error: %s", self.address, exc)
+        finally:
+            if not cancelled:
+                try:
+                    client._holman_closed = True
+                except Exception:
+                    _LOGGER.debug(
+                        "Holman %s: could not mark client closed", self.address
+                    )
+                # disconnect() has returned. Drop the stored reference before
+                # this task yields so a callback from the close cannot observe
+                # a client we have already disconnected.
+                if self._client is client:
+                    self._client = None
+            self._disconnecting.discard(key)
+            current = self._disconnect_tasks.get(key)
+            if current is asyncio.current_task():
+                self._disconnect_tasks.pop(key, None)
+
+    async def _await_shielded(self, task: asyncio.Task, timeout: float) -> None:
+        """Wait for task. Cancelling this caller does not cancel task.
+
+        At timeout the task is cancelled. That is the bound for a stuck
+        close. If this caller was cancelled, CancelledError is raised
+        only after the wait.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        cancelled = self._absorb_cancel()
+        while not task.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                if not task.done():
+                    _LOGGER.debug(
+                        "Holman %s: abandoning a close after %.0fs",
+                        self.address, timeout,
+                    )
+                    task.cancel()
+                break
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+            except TimeoutError:
+                if not task.done():
+                    _LOGGER.debug(
+                        "Holman %s: abandoning a close after %.0fs",
+                        self.address, timeout,
+                    )
+                    task.cancel()
+                break
+            except asyncio.CancelledError:
+                # Our own cancel raises here while the shielded task keeps
+                # running. A cancel of the task itself (the timeout abandon)
+                # also surfaces as CancelledError; that close is already over.
+                if self._absorb_cancel():
+                    cancelled = True
+                if task.done() or not cancelled:
+                    break
+                continue
+        if cancelled or self._absorb_cancel():
+            raise asyncio.CancelledError
+
     async def _disconnect_client(self, client) -> None:
+        """Finish disconnect() even when this task is being cancelled.
+
+        The caller often holds the client only in a local. async_stop
+        cancels that task, and CancelledError is not an Exception, so a
+        bare await aborts the GATT close and drops the proxy slot.
+        """
+        if client is None:
+            return
+        task = self._track_disconnect(client)
+        if task is None:
+            if self._absorb_cancel():
+                raise asyncio.CancelledError
+            return
+        await self._await_shielded(task, DISCONNECT_TIMEOUT_S)
+
+    async def _close_local(self, client) -> None:
+        """Disconnect a client, then drop self._client if it is still that one."""
         if client is None:
             return
         try:
-            await asyncio.wait_for(client.disconnect(), timeout=DISCONNECT_TIMEOUT_S)
-        except Exception as exc:
-            _LOGGER.debug("Holman %s: disconnect error: %s", self.address, exc)
+            await self._disconnect_client(client)
+        finally:
+            if self._client is client:
+                self._client = None
+
+    async def _drain_disconnects(self) -> None:
+        """Wait out closes still running after their owner was left behind."""
+        tasks = [
+            task for task in list(self._disconnect_tasks.values()) if not task.done()
+        ]
+        for task in tasks:
+            await self._await_shielded(task, DISCONNECT_TIMEOUT_S)
 
     async def _release_proxy_slot(self) -> None:
         """Best-effort BlueZ stale-connection cleanup.
@@ -346,9 +488,7 @@ class HolmanDevice:
         """Disconnect this client and forget it. Does not schedule a reconnect."""
         if client is None:
             return
-        if self._client is client:
-            self._client = None
-        await self._disconnect_client(client)
+        await self._close_local(client)
         await self._release_proxy_slot()
 
     def _note_failure(self, exc: BaseException) -> None:
@@ -439,42 +579,60 @@ class HolmanDevice:
         if self._stopping:
             raise RuntimeError(f"{self.address}: integration is stopping")
         client = self._live_client()
-        if client is None:
-            if self._client is not None:
-                await self._abandon(self._client)
-            if self._ready_in() > 0:
-                raise RuntimeError(
-                    f"{self.address}: not connected; next attempt in "
-                    f"{self._ready_in():.0f}s"
-                )
-            self._mark_wanted()
+        try:
+            if client is None:
+                held = self._client
+                if held is not None and id(held) not in self._disconnecting:
+                    await self._abandon(held)
+                if self._stopping:
+                    raise RuntimeError(f"{self.address}: integration is stopping")
+                if self._ready_in() > 0:
+                    raise RuntimeError(
+                        f"{self.address}: not connected; next attempt in "
+                        f"{self._ready_in():.0f}s"
+                    )
+                self._mark_wanted()
+                try:
+                    client = await self._open()
+                except AttemptDeferred as exc:
+                    raise RuntimeError(str(exc)) from exc
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    if not self._stopping:
+                        self._note_failure(exc)
+                    raise
+                if self._stopping:
+                    await self._abandon(client)
+                    raise RuntimeError(f"{self.address}: integration is stopping")
+                if PERSISTENT:
+                    self._client = client
+                    self._note_success()
+            dropped = False
             try:
-                client = await self._open()
-            except AttemptDeferred as exc:
-                raise RuntimeError(str(exc)) from exc
+                for frame in command_frames:
+                    await self._write(client, frame)
             except Exception as exc:
-                if not self._stopping:
+                dropped = True
+                await self._abandon(client)
+                client = None
+                if PERSISTENT and not self._stopping:
                     self._note_failure(exc)
                 raise
-            if self._stopping:
-                await self._abandon(client)
-                raise RuntimeError(f"{self.address}: integration is stopping")
-            if PERSISTENT:
-                self._client = client
-                self._note_success()
-        dropped = False
-        try:
-            for frame in command_frames:
-                await self._write(client, frame)
-        except Exception as exc:
-            dropped = True
-            await self._abandon(client)
-            if PERSISTENT and not self._stopping:
-                self._note_failure(exc)
+            finally:
+                if not PERSISTENT and not dropped and client is not None:
+                    await self._disconnect_client(client)
+        except asyncio.CancelledError:
+            # Handshake, the command write, or the non-persistent close can
+            # be the await stop cancels. The client is local until stored.
+            if (
+                client is not None
+                and not getattr(client, "_holman_closed", False)
+            ):
+                await self._close_local(client)
+            elif client is not None and self._client is client:
+                self._client = None
             raise
-        finally:
-            if not PERSISTENT and not dropped:
-                await self._disconnect_client(client)
 
     def _spawn(self, coro, suffix: str):
         name = f"holman_{suffix}_{self.address}"
@@ -546,8 +704,9 @@ class HolmanDevice:
             if self._stopping:
                 return
             client = self._client
-            self._client = None
-        await self._disconnect_client(client)
+        # Leave self._client in place until the close finishes. _live_client
+        # hides it once the disconnect task is tracked.
+        await self._close_local(client)
         await self._release_proxy_slot()
         if self._stopping:
             return
@@ -558,6 +717,7 @@ class HolmanDevice:
         self._schedule_reconnect()
 
     async def _reconnect(self) -> None:
+        pending = None
         try:
             while not self._stopping:
                 delay = self._ready_in()
@@ -570,24 +730,34 @@ class HolmanDevice:
                     if self._live_client() is not None:
                         return
                     self._mark_wanted()
+                    pending = None
                     try:
-                        client = await self._open()
+                        pending = await self._open()
                     except AttemptDeferred:
-                        pass
+                        pending = None
+                    except asyncio.CancelledError:
+                        # _open disconnects a client it already holds.
+                        pending = None
+                        raise
                     except Exception as exc:
+                        pending = None
                         if self._stopping:
                             return
                         self._note_failure(exc)
                         continue
                     else:
                         if self._stopping:
-                            await self._abandon(client)
+                            await self._abandon(pending)
+                            pending = None
                             return
-                        self._client = client
+                        self._client = pending
+                        pending = None
                         self._note_success()
                         return
                 await asyncio.sleep(RECONNECT_SOON_S)
         except asyncio.CancelledError:
+            if pending is not None and not getattr(pending, "_holman_closed", False):
+                await self._close_local(pending)
             raise
         except Exception:
             _LOGGER.exception("Holman %s: reconnect loop crashed", self.address)
@@ -606,6 +776,10 @@ class HolmanDevice:
                 try:
                     await self._write(client, set_time_frame(dt_util.now()))
                 except asyncio.CancelledError:
+                    # The write is local to this task until it returns. Close
+                    # before releasing the lock so stop cannot time out and
+                    # leave the link up.
+                    await self._close_local(client)
                     raise
                 except Exception as exc:
                     await self._abandon(client)
@@ -668,17 +842,20 @@ class HolmanDevice:
             await self._await_cancelled(self._command_task)
             connect_task = self._connect_task
             if connect_task is not None:
-                await self._disconnect_client(
-                    await self._take_connect_result(connect_task)
-                )
-                if self._connect_task is connect_task:
-                    self._connect_task = None
+                try:
+                    await self._disconnect_client(
+                        await self._take_connect_result(connect_task)
+                    )
+                finally:
+                    if self._connect_task is connect_task:
+                        self._connect_task = None
             client = None
+            got_lock = False
             try:
                 async with asyncio.timeout(DISCONNECT_TIMEOUT_S):
                     async with self._lock:
                         client = self._client
-                        self._client = None
+                        got_lock = True
             except TimeoutError:
                 # Another coroutine still holds the lock and the client.
                 # Do not clear self._client out from under it. That coroutine
@@ -687,7 +864,11 @@ class HolmanDevice:
                     "Holman %s: stop timed out waiting for the BLE lock",
                     self.address,
                 )
-            await self._disconnect_client(client)
+            if got_lock:
+                await self._close_local(client)
+            # A background close can outlive _cancel_task's wait. Do not
+            # return while that disconnect() is still the only reference.
+            await self._drain_disconnects()
             _LOGGER.info("Holman %s: disconnected", self.address)
         finally:
             self._stop_wait.set()

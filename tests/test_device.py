@@ -50,23 +50,67 @@ class FakeHass:
 
 
 class FakeClient:
+    """connect, write, and disconnect all yield so a cancel can land."""
+
     def __init__(self, fail_write=False):
         self.is_connected = True
         self.fail_write = fail_write
         self.disconnects = 0
+        self.disconnect_cancelled = 0
+        self.connects = 0
+        self.connect_cancelled = 0
+        self.write_cancelled = 0
         self.writes = []
         self._notify = None
         self.disconnected = asyncio.Event()
+        self.disconnect_started = asyncio.Event()
+        self.connect_started = asyncio.Event()
+        self.write_started = asyncio.Event()
+        self.release_disconnect = asyncio.Event()
+        self.release_disconnect.set()
+        self.release_connect = asyncio.Event()
+        self.release_connect.set()
+        self.release_write = asyncio.Event()
+        self.release_write.set()
+
+    async def connect(self, *_args, **_kwargs):
+        self.connect_started.set()
+        try:
+            await asyncio.sleep(0)
+            if not self.release_connect.is_set():
+                await self.release_connect.wait()
+        except asyncio.CancelledError:
+            self.connect_cancelled += 1
+            raise
+        self.connects += 1
+        self.is_connected = True
 
     async def disconnect(self):
+        self.disconnect_started.set()
+        try:
+            await asyncio.sleep(0)
+            if not self.release_disconnect.is_set():
+                await self.release_disconnect.wait()
+        except asyncio.CancelledError:
+            self.disconnect_cancelled += 1
+            raise
         self.disconnects += 1
         self.is_connected = False
         self.disconnected.set()
 
     async def start_notify(self, _uuid, callback):
         self._notify = callback
+        await asyncio.sleep(0)
 
     async def write_gatt_char(self, _uuid, data, response=True):
+        self.write_started.set()
+        try:
+            await asyncio.sleep(0)
+            if not self.release_write.is_set():
+                await self.release_write.wait()
+        except asyncio.CancelledError:
+            self.write_cancelled += 1
+            raise
         payload = bytes(data)
         self.writes.append(payload)
         if self.fail_write:
@@ -178,6 +222,7 @@ def test_keepalive_failure_disconnects_and_backs_off(monkeypatch):
             dev.async_start()
             started = len(hass.tasks)
             await asyncio.wait_for(client.disconnected.wait(), 2)
+            await asyncio.sleep(0.01)
             assert client.disconnects == 1
             assert dev._client is None
             assert dev._failure_count == 0
@@ -297,6 +342,7 @@ def test_stale_advert_drops_the_link_once():
             dev._on_advert(SimpleNamespace(time=now), None)
             dev._on_advert(SimpleNamespace(time=now), None)
             await asyncio.wait_for(client.disconnected.wait(), 2)
+            await asyncio.sleep(0.01)
             assert client.disconnects == 1
             assert dev._client is None
             assert device_mod.establish_connection.calls == []
@@ -588,5 +634,331 @@ def test_remove_entry_deletes_the_persistent_repair(monkeypatch):
         args, _kwargs = deleted[0]
         assert args[1] == "holman_igardener"
         assert args[2] == "unreachable_c56ad4a14a88"
+
+    asyncio.run(_body())
+
+
+def test_stop_during_connect_does_not_cancel_it(monkeypatch):
+    """establish_connection's connect() is inside the dial task. Stop must not cancel it."""
+    monkeypatch.setattr(device_mod, "STARTUP_DELAY_S", 0)
+    held = []
+
+    async def _establish(*_args, **_kwargs):
+        client = FakeClient()
+        client.release_connect.clear()
+        held.append(client)
+        await client.connect()
+        return client
+
+    async def _body():
+        _hass, dev = _device()
+        _allow_dial(dev, monkeypatch, _establish)
+        try:
+            dev.async_start()
+            for _ in range(100):
+                if held:
+                    break
+                await asyncio.sleep(0.01)
+            assert held
+            await asyncio.wait_for(held[0].connect_started.wait(), 2)
+            stop = asyncio.create_task(dev.async_stop())
+            await asyncio.sleep(0.05)
+            assert not stop.done()
+            assert held[0].connect_cancelled == 0
+            assert held[0].disconnects == 0
+            held[0].release_connect.set()
+            await asyncio.wait_for(stop, 2)
+            assert held[0].connect_cancelled == 0
+            assert held[0].disconnects == 1
+            assert held[0].disconnect_cancelled == 0
+            assert held[0].is_connected is False
+            assert dev._client is None
+        finally:
+            if held:
+                held[0].release_connect.set()
+                held[0].release_disconnect.set()
+            if not dev._stopping:
+                await dev.async_stop()
+
+    asyncio.run(_body())
+
+
+def test_stop_during_post_budget_disconnect_is_not_cancelled(monkeypatch):
+    """Stop that starts during the post-budget close must let that close finish."""
+    monkeypatch.setattr(device_mod, "STARTUP_DELAY_S", 0)
+    monkeypatch.setattr(device_mod, "CONNECT_BUDGET_S", 0.05)
+    dial_cancelled = []
+    held = []
+    dial_release = asyncio.Event()
+    dial_entered = asyncio.Event()
+
+    async def _establish(*_args, **_kwargs):
+        client = FakeClient()
+        client.release_disconnect.clear()
+        held.append(client)
+        dial_entered.set()
+        try:
+            await dial_release.wait()
+        except asyncio.CancelledError:
+            dial_cancelled.append(1)
+            raise
+        return client
+
+    async def _body():
+        _hass, dev = _device()
+        _allow_dial(dev, monkeypatch, _establish)
+        try:
+            dev.async_start()
+            await asyncio.wait_for(dial_entered.wait(), 2)
+            await asyncio.sleep(0.12)
+            assert dev._connect_task is not None
+            dial_release.set()
+            await asyncio.wait_for(held[0].disconnect_started.wait(), 2)
+            assert dev._client is None
+            assert dev._connect_task is not None
+            stop = asyncio.create_task(dev.async_stop())
+            await asyncio.sleep(0.05)
+            assert dial_cancelled == []
+            assert not stop.done()
+            assert held[0].disconnect_cancelled == 0
+            assert held[0].disconnects == 0
+            assert held[0].is_connected is True
+            held[0].release_disconnect.set()
+            await asyncio.wait_for(stop, 2)
+            assert dial_cancelled == []
+            assert held[0].disconnect_cancelled == 0
+            assert held[0].disconnects == 1
+            assert held[0].is_connected is False
+            assert dev._client is None
+            assert dev._connect_task is None
+            assert dev._failure_count == 0
+        finally:
+            dial_release.set()
+            if held:
+                held[0].release_disconnect.set()
+            if not dev._stopping:
+                await dev.async_stop()
+
+    asyncio.run(_body())
+
+
+def test_stop_during_turn_on_post_budget_disconnect_is_not_cancelled(monkeypatch):
+    """turn_on in the post-budget close must not be left connected."""
+    monkeypatch.setattr(device_mod, "STARTUP_DELAY_S", 0)
+    monkeypatch.setattr(device_mod, "CONNECT_BUDGET_S", 0.05)
+    dial_cancelled = []
+    held = []
+    dial_release = asyncio.Event()
+    dial_entered = asyncio.Event()
+
+    async def _establish(*_args, **_kwargs):
+        client = FakeClient()
+        client.release_disconnect.clear()
+        held.append(client)
+        dial_entered.set()
+        try:
+            await dial_release.wait()
+        except asyncio.CancelledError:
+            dial_cancelled.append(1)
+            raise
+        return client
+
+    async def _body():
+        _hass, dev = _device()
+        _allow_dial(dev, monkeypatch, _establish)
+        turn = asyncio.create_task(dev.turn_on())
+        try:
+            await asyncio.wait_for(dial_entered.wait(), 2)
+            await asyncio.sleep(0.12)
+            dial_release.set()
+            await asyncio.wait_for(held[0].disconnect_started.wait(), 2)
+            stop = asyncio.create_task(dev.async_stop())
+            await asyncio.sleep(0.05)
+            assert dial_cancelled == []
+            assert not stop.done()
+            assert held[0].disconnect_cancelled == 0
+            assert held[0].is_connected is True
+            held[0].release_disconnect.set()
+            await asyncio.wait_for(stop, 2)
+            if not turn.done():
+                try:
+                    await asyncio.wait_for(turn, 2)
+                except asyncio.CancelledError:
+                    pass
+            else:
+                try:
+                    turn.result()
+                except asyncio.CancelledError:
+                    pass
+            assert dial_cancelled == []
+            assert held[0].disconnect_cancelled == 0
+            assert held[0].disconnects == 1
+            assert held[0].is_connected is False
+            assert dev._client is None
+            assert dev.on is False
+            assert dev._failure_count == 0
+        finally:
+            dial_release.set()
+            if held:
+                held[0].release_disconnect.set()
+            if not turn.done():
+                turn.cancel()
+            if not dev._stopping:
+                await dev.async_stop()
+
+    asyncio.run(_body())
+
+
+def test_stop_during_stale_disconnect_is_not_cancelled():
+    """Stale-drop clears nothing until its disconnect() has finished."""
+
+    async def _body():
+        _hass, dev = _device()
+        client = FakeClient()
+        client.release_disconnect.clear()
+        dev._client = client
+        dev._link_up_at = time.monotonic() - 60
+        dev._startup_not_before = time.monotonic() + 1000
+        try:
+            dev._on_advert(SimpleNamespace(time=time.monotonic()), None)
+            await asyncio.wait_for(client.disconnect_started.wait(), 2)
+            assert dev._client is client
+            stop = asyncio.create_task(dev.async_stop())
+            await asyncio.sleep(0.05)
+            assert not stop.done()
+            assert dev._client is client
+            assert client.disconnect_cancelled == 0
+            assert client.disconnects == 0
+            assert client.is_connected is True
+            client.release_disconnect.set()
+            await asyncio.wait_for(stop, 2)
+            assert client.disconnect_cancelled == 0
+            assert client.disconnects == 1
+            assert client.is_connected is False
+            assert dev._client is None
+        finally:
+            client.release_disconnect.set()
+            if not dev._stopping:
+                await dev.async_stop()
+
+    asyncio.run(_body())
+
+
+def test_stop_during_handshake_disconnect_is_not_cancelled(monkeypatch):
+    """A cancel that lands on the handshake still finishes the cleanup close."""
+    monkeypatch.setattr(device_mod, "STARTUP_DELAY_S", 0)
+    held = []
+
+    async def _establish(*_args, **_kwargs):
+        client = FakeClient()
+        client.release_write.clear()
+        client.release_disconnect.clear()
+        held.append(client)
+        return client
+
+    async def _body():
+        _hass, dev = _device()
+        _allow_dial(dev, monkeypatch, _establish)
+        try:
+            dev.async_start()
+            for _ in range(100):
+                if held:
+                    break
+                await asyncio.sleep(0.01)
+            assert held
+            await asyncio.wait_for(held[0].write_started.wait(), 2)
+            stop = asyncio.create_task(dev.async_stop())
+            await asyncio.wait_for(held[0].disconnect_started.wait(), 2)
+            await asyncio.sleep(0.05)
+            assert not stop.done()
+            assert held[0].disconnect_cancelled == 0
+            assert held[0].is_connected is True
+            assert dev._client is None
+            held[0].release_disconnect.set()
+            await asyncio.wait_for(stop, 2)
+            assert held[0].disconnect_cancelled == 0
+            assert held[0].disconnects == 1
+            assert held[0].is_connected is False
+            assert dev._client is None
+            assert dev._failure_count == 0
+        finally:
+            if held:
+                held[0].release_write.set()
+                held[0].release_disconnect.set()
+            if not dev._stopping:
+                await dev.async_stop()
+
+    asyncio.run(_body())
+
+
+def test_stop_during_keepalive_disconnect_is_not_cancelled(monkeypatch):
+    """Keepalive's cleanup close is not aborted when stop cancels that task."""
+    monkeypatch.setattr(device_mod, "KEEPALIVE_S", 0.01)
+
+    async def _body():
+        _hass, dev = _device()
+        client = FakeClient(fail_write=True)
+        client.release_disconnect.clear()
+        dev._client = client
+        dev._link_up_at = time.monotonic()
+        dev._startup_not_before = time.monotonic() + 1000
+        try:
+            dev.async_start()
+            await asyncio.wait_for(client.disconnect_started.wait(), 2)
+            assert dev._client is client
+            stop = asyncio.create_task(dev.async_stop())
+            await asyncio.sleep(0.05)
+            assert not stop.done()
+            assert dev._client is client
+            assert client.disconnect_cancelled == 0
+            assert client.is_connected is True
+            client.release_disconnect.set()
+            await asyncio.wait_for(stop, 2)
+            assert client.disconnect_cancelled == 0
+            assert client.disconnects == 1
+            assert client.is_connected is False
+            assert dev._client is None
+        finally:
+            client.release_disconnect.set()
+            if not dev._stopping:
+                await dev.async_stop()
+
+    asyncio.run(_body())
+
+
+def test_stop_during_command_write_disconnect_is_not_cancelled():
+    """A command write cancelled by stop still disconnects the stored client."""
+
+    async def _body():
+        _hass, dev = _device()
+        client = FakeClient()
+        client.release_write.clear()
+        client.release_disconnect.clear()
+        dev._client = client
+        dev._link_up_at = time.monotonic()
+        turn = asyncio.create_task(dev.turn_on())
+        try:
+            await asyncio.wait_for(client.write_started.wait(), 2)
+            stop = asyncio.create_task(dev.async_stop())
+            await asyncio.wait_for(client.disconnect_started.wait(), 2)
+            await asyncio.sleep(0.05)
+            assert not stop.done()
+            assert client.disconnect_cancelled == 0
+            assert client.is_connected is True
+            assert dev._client is client
+            client.release_disconnect.set()
+            await asyncio.wait_for(stop, 2)
+            assert client.disconnect_cancelled == 0
+            assert client.disconnects == 1
+            assert client.is_connected is False
+            assert dev._client is None
+            assert dev.on is False
+        finally:
+            client.release_write.set()
+            client.release_disconnect.set()
+            if not turn.done():
+                turn.cancel()
+            if not dev._stopping:
+                await dev.async_stop()
 
     asyncio.run(_body())
