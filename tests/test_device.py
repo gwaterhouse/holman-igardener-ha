@@ -430,6 +430,56 @@ def test_connect_budget_disconnects_and_does_not_store(monkeypatch):
     asyncio.run(_body())
 
 
+def test_stop_after_budget_does_not_cancel_a_live_dial(monkeypatch):
+    """Stop during the post-budget wait must not cancel a connected dial."""
+    monkeypatch.setattr(device_mod, "STARTUP_DELAY_S", 0)
+    monkeypatch.setattr(device_mod, "CONNECT_BUDGET_S", 0.05)
+    cancelled = []
+    held = []
+    connected = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _establish(*_args, **_kwargs):
+        client = FakeClient()
+        held.append(client)
+        connected.set()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.append(1)
+            raise
+        return client
+
+    async def _body():
+        _hass, dev = _device()
+        _allow_dial(dev, monkeypatch, _establish)
+        try:
+            dev.async_start()
+            await asyncio.wait_for(connected.wait(), 2)
+            # The client exists and the dial has not returned. Wait out the
+            # budget so stop lands in the post-budget wait, not the first shield.
+            await asyncio.sleep(0.12)
+            assert dev._connect_task is not None
+            stop = asyncio.create_task(dev.async_stop())
+            await asyncio.sleep(0.05)
+            assert not stop.done()
+            assert cancelled == []
+            assert held[0].disconnects == 0
+            assert held[0].is_connected is True
+            release.set()
+            await asyncio.wait_for(stop, 2)
+            assert cancelled == []
+            assert held[0].disconnects == 1
+            assert held[0].is_connected is False
+            assert dev._client is None
+        finally:
+            release.set()
+            if not dev._stopping:
+                await dev.async_stop()
+
+    asyncio.run(_body())
+
+
 def test_stop_during_dial_disconnects_and_does_not_store(monkeypatch):
     """Cancelling the reconnect task must still disconnect the dial's client."""
     monkeypatch.setattr(device_mod, "STARTUP_DELAY_S", 0)

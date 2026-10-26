@@ -260,7 +260,8 @@ class HolmanDevice:
         stays taken. max_attempts limits timeouts and connect errors only;
         ESPHome out-of-slot errors keep retrying inside the library.
         A deadline or a stop waits for the call to finish, then disconnects
-        any client it returned.
+        any client it returned. The wait after the deadline is shielded too:
+        a bare await is what cancels the dial when shutdown lands there.
         """
         task = asyncio.create_task(
             establish_connection(
@@ -285,18 +286,32 @@ class HolmanDevice:
                 await self._disconnect_client(await self._take_connect_result(task))
                 raise
         finally:
+            # Drop the handle only after the handlers above have disconnected.
             if self._connect_task is task:
                 self._connect_task = None
 
     async def _take_connect_result(self, task):
-        """Await a dial that must not be cancelled. Return its client, or None."""
-        current = asyncio.current_task()
-        if current is not None:
-            while current.cancelling():
-                current.uncancel()
+        """Wait until the dial finishes without cancelling it.
+
+        Shutdown cancels this task. A bare await would cancel the dial too.
+        Shield it, and if that wait is cancelled, uncancel and keep waiting.
+        """
+        while not task.done():
+            current = asyncio.current_task()
+            if current is not None:
+                while current.cancelling():
+                    current.uncancel()
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.done():
+                    break
+                continue
+            except Exception:
+                return None
         try:
-            return await task
-        except Exception:
+            return task.result()
+        except (asyncio.CancelledError, Exception):
             return None
 
     async def _disconnect_client(self, client) -> None:
