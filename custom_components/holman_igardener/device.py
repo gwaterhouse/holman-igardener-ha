@@ -1,11 +1,14 @@
 """BLE connection handling for the Holman iGardener RGB (Vibrance_RGB) controller.
 
 The controller accepts a single connection and only advertises briefly after
-power-on or a disconnect, so the link is held open persistently:
-  connect -> subscribe notify -> identify (wait for reply) -> set time
-  -> session frame -> init slots 0..3 -> control frames as needed.
-A 0x24 time frame is written every KEEPALIVE_S seconds to keep the link
-alive and detect dead connections; a new advertisement triggers a reconnect.
+power-on or a disconnect. The protocol has no close command. The link is held
+open, and shutdown waits for the Bluetooth client to disconnect so the
+controller can advertise again.
+
+One reconnect task owns retries. The first attempt waits out the startup
+delay. A dropped link is retried once, shortly after. Failed attempts then
+wait 30s, 60s, 120s and 180s. Advertisements do not start extra connects.
+If the controller stays unreachable, a repair issue asks for a power-cycle.
 """
 from __future__ import annotations
 
@@ -23,10 +26,17 @@ from homeassistant.components.bluetooth import (
     BluetoothCallbackMatcher,
     BluetoothChange,
 )
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.util import dt as dt_util
-from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
+from bleak_retry_connector import (
+    BleakClientWithServiceCache,
+    close_stale_connections_by_address,
+    establish_connection,
+)
 
+from .const import DOMAIN
 from .protocol import (
     NOTIFY_UUID,
     WRITE_UUID,
@@ -38,13 +48,27 @@ from .protocol import (
     session_frame,
     set_time_frame,
 )
+from .recovery import (
+    CONNECT_ATTEMPTS,
+    CONNECT_BUDGET_S,
+    DISCONNECT_TIMEOUT_S,
+    GATT_OP_TIMEOUT_S,
+    RECONNECT_SOON_S,
+    STALE_ADV_GRACE_S,
+    STARTUP_DELAY_S,
+    UNREACHABLE_REPAIR_S,
+    WATCHDOG_INTERVAL_S,
+    AttemptDeferred,
+    backoff_seconds,
+    ready_in,
+    repair_due,
+    unreachable_issue_id,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 ADV_MAX_AGE_S = 10.0
 ADV_WAIT_S = 30.0  # controller advertises sparsely; wait for a fresh one
-FAIL_COOLDOWN_S = 20.0
-CONNECT_ATTEMPTS = 2  # one retry; first attempts commonly fail with GATT 133
 LOCAL_ADAPTER_PREFIX = "hci"  # some onboard adapters cannot connect; prefer proxies
 IDENTIFY_NOTIFY_TIMEOUT_S = 5.0
 # Persistent link: the controller stops advertising a while after a
@@ -63,8 +87,23 @@ class HolmanDevice:
         self.on = False
         self._lock = asyncio.Lock()
         self._fail_until = 0.0  # monotonic
+        self._failure_count = 0
         self._identify_event = asyncio.Event()
         self._client = None
+        self._stopping = False
+        self._stop_wait: asyncio.Event | None = None
+        self._startup_not_before = (
+            time.monotonic() + STARTUP_DELAY_S if PERSISTENT else 0.0
+        )
+        self._wanted_since: float | None = None
+        self._link_up_at: float | None = None
+        self._repair_open = False
+        self._reconnect_task: asyncio.Task | None = None
+        self._keepalive_task: asyncio.Task | None = None
+        self._watchdog_task: asyncio.Task | None = None
+        self._stale_task: asyncio.Task | None = None
+        self._unsub_adv = None
+        self._unsub_stop = None
 
     def _notify(self, _char, data: bytearray) -> None:
         raw = bytes(data)
@@ -72,14 +111,32 @@ class HolmanDevice:
         if is_identify_response(raw):
             self._identify_event.set()
 
+    def _live_client(self):
+        client = self._client
+        if client is not None and getattr(client, "is_connected", False):
+            return client
+        return None
+
+    def _ready_in(self) -> float:
+        return ready_in(time.monotonic(), self._startup_not_before, self._fail_until)
+
+    def _mark_wanted(self) -> None:
+        """Start the unreachable clock once we actually want a link."""
+        if self._wanted_since is None:
+            self._wanted_since = time.monotonic()
+
+    def _advert_time(self, service_info) -> float:
+        stamp = getattr(service_info, "time", None)
+        if isinstance(stamp, (int, float)):
+            return float(stamp)
+        return time.monotonic()
+
     async def _ensure_can_attempt(self) -> None:
-        now = time.monotonic()
-        if now < self._fail_until:
-            remaining = self._fail_until - now
-            raise RuntimeError(
-                f"{self.address}: connect cooldown "
-                f"({remaining:.0f}s left after previous failure)"
+        if self._stopping or self._ready_in() > 0:
+            raise AttemptDeferred(
+                f"{self.address}: next attempt in {self._ready_in():.0f}s"
             )
+        now = time.monotonic()
         info = async_last_service_info(
             self.hass, self.address, connectable=True
         )
@@ -98,10 +155,10 @@ class HolmanDevice:
                 BluetoothScanningMode.ACTIVE,
                 ADV_WAIT_S,
             )
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise RuntimeError(
                 f"{self.address}: no advertisement within {ADV_WAIT_S:.0f}s "
-                "(out of range of a connectable proxy?)"
+                "(out of range, or the controller is not advertising)"
             ) from exc
 
     def _best_device(self):
@@ -121,138 +178,449 @@ class HolmanDevice:
         return async_ble_device_from_address(
             self.hass, self.address, connectable=True)
 
-    def _on_disconnect(self, _client) -> None:
-        _LOGGER.debug("Holman %s: link dropped", self.address)
+    def _on_disconnect(self, client) -> None:
+        # Ignore disconnects we initiated: the caller already cleared
+        # self._client and decides whether to reconnect.
+        if self._client is not client or self._stopping:
+            if self._client is client:
+                self._client = None
+            return
         self._client = None
+        self._reconnect_soon("link dropped")
+
+    async def _write(self, client, frame: bytes) -> None:
+        _LOGGER.debug("Holman write %s -> %s", WRITE_UUID, frame.hex())
+        await asyncio.wait_for(
+            client.write_gatt_char(WRITE_UUID, frame, response=True),
+            timeout=GATT_OP_TIMEOUT_S,
+        )
 
     async def _open(self):
         """Connect + reconnect-init handshake; return a ready client."""
         await self._ensure_can_attempt()
         device = self._best_device()
         if device is None:
-            self._fail_until = time.monotonic() + FAIL_COOLDOWN_S
             raise RuntimeError(
                 f"{self.address} not seen by HA bluetooth (check range/proxy)"
             )
         t0 = time.monotonic()
+        # BlueZ only: drop a stale kernel connection before dialing. This is
+        # a no-op for an ESPHome proxy; that slot is released by disconnect()
+        # on the client we held, or by the proxy when its API session ends.
+        await self._release_proxy_slot()
         try:
-            client = await establish_connection(
-                BleakClientWithServiceCache,
-                device,
-                self.address,
-                disconnected_callback=self._on_disconnect,
-                max_attempts=CONNECT_ATTEMPTS,
+            client = await asyncio.wait_for(
+                establish_connection(
+                    BleakClientWithServiceCache,
+                    device,
+                    self.address,
+                    disconnected_callback=self._on_disconnect,
+                    max_attempts=CONNECT_ATTEMPTS,
+                ),
+                timeout=CONNECT_BUDGET_S,
             )
+        except TimeoutError as exc:
+            await self._release_proxy_slot()
+            raise RuntimeError(f"{self.address}: connect timed out") from exc
         except Exception:
-            self._fail_until = time.monotonic() + FAIL_COOLDOWN_S
-            _LOGGER.warning("Holman %s: connect failed; cooling down %ss",
-                            self.address, FAIL_COOLDOWN_S)
+            await self._release_proxy_slot()
             raise
         try:
             try:
-                await client.start_notify(NOTIFY_UUID, self._notify)
+                await asyncio.wait_for(
+                    client.start_notify(NOTIFY_UUID, self._notify),
+                    timeout=GATT_OP_TIMEOUT_S,
+                )
             except Exception as exc:
                 _LOGGER.warning("Holman %s: notify subscribe failed: %s",
                                 self.address, exc)
             self._identify_event.clear()
-            await client.write_gatt_char(WRITE_UUID, identify_frame(), response=True)
+            await self._write(client, identify_frame())
             try:
                 await asyncio.wait_for(self._identify_event.wait(),
                                        timeout=IDENTIFY_NOTIFY_TIMEOUT_S)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 _LOGGER.warning("Holman %s: identify notify timed out", self.address)
             when = dt_util.now()
             frames = (reconnect_init_frames(when, self.rgb, self.level)
                       if self.full_init else [set_time_frame(when), session_frame()])
             for frame in frames:
-                _LOGGER.debug("Holman write %s -> %s", WRITE_UUID, frame.hex())
-                await client.write_gatt_char(WRITE_UUID, frame, response=True)
-        except Exception:
-            self._fail_until = time.monotonic() + FAIL_COOLDOWN_S
-            await self._safe_disconnect(client)
+                await self._write(client, frame)
+        except asyncio.CancelledError:
+            await self._disconnect_client(client)
             raise
-        self._fail_until = 0.0
+        except Exception:
+            await self._abandon(client)
+            raise
         _LOGGER.debug("Holman %s: link up + init in %.1fs", self.address,
                       time.monotonic() - t0)
         return client
 
-    async def _safe_disconnect(self, client) -> None:
+    async def _disconnect_client(self, client) -> None:
+        if client is None:
+            return
         try:
-            await client.disconnect()
+            await asyncio.wait_for(client.disconnect(), timeout=DISCONNECT_TIMEOUT_S)
         except Exception as exc:
             _LOGGER.debug("Holman %s: disconnect error: %s", self.address, exc)
 
-    async def _send(self, command_frames: list[bytes]) -> None:
-        client = self._client if (self._client and self._client.is_connected) else None
+    async def _release_proxy_slot(self) -> None:
+        """Best-effort BlueZ stale-connection cleanup.
+
+        close_stale_connections_by_address returns immediately unless this
+        host is Linux and BlueZ still has the device. It does not clear an
+        ESPHome Bluetooth proxy connection slot. The slot this integration
+        can release is the one held by its own client, via disconnect().
+        After a hard kill the proxy frees that slot when the API session
+        drops. Do not construct another Bleak client just to disconnect:
+        the ESPHome backend needs the proxy API session and a second client
+        will not free the slot.
+        """
+        try:
+            await close_stale_connections_by_address(self.address)
+        except Exception as exc:
+            _LOGGER.debug(
+                "Holman %s: stale connection cleanup failed: %s",
+                self.address, exc,
+            )
+
+    async def _abandon(self, client) -> None:
+        """Disconnect this client and forget it. Does not schedule a reconnect."""
         if client is None:
-            client = await self._open()
+            return
+        if self._client is client:
+            self._client = None
+        await self._disconnect_client(client)
+        await self._release_proxy_slot()
+
+    def _note_failure(self, exc: BaseException) -> None:
+        self._failure_count += 1
+        wait = backoff_seconds(self._failure_count)
+        self._fail_until = time.monotonic() + wait
+        self._mark_wanted()
+        _LOGGER.warning(
+            "Holman %s: connect failed (%s); next attempt in %.0fs (failure %s)",
+            self.address, exc, wait, self._failure_count,
+        )
+        self._maybe_raise_repair()
+        self._schedule_reconnect()
+
+    def _note_success(self) -> None:
+        failed = self._failure_count
+        had_issue = self._repair_open
+        self._failure_count = 0
+        self._fail_until = 0.0
+        self._wanted_since = None
+        self._link_up_at = time.monotonic()
+        self._clear_repair()
+        if had_issue:
+            _LOGGER.info(
+                "Holman %s: link is back; cleared the repair issue", self.address
+            )
+        elif failed:
+            _LOGGER.info(
+                "Holman %s: link recovered after %s failed attempt(s)",
+                self.address, failed,
+            )
+        else:
+            _LOGGER.info("Holman %s: link up", self.address)
+
+    def _reconnect_soon(self, reason: str) -> None:
+        if self._stopping:
+            return
+        _LOGGER.warning(
+            "Holman %s: %s; reconnecting in %.0fs",
+            self.address, reason, RECONNECT_SOON_S,
+        )
+        self._fail_until = time.monotonic() + RECONNECT_SOON_S
+        self._mark_wanted()
+        self._schedule_reconnect()
+
+    def _maybe_raise_repair(self) -> None:
+        if self._stopping or self._repair_open:
+            return
+        if not repair_due(
+            time.monotonic(),
+            self._wanted_since,
+            self._live_client() is not None,
+            after=UNREACHABLE_REPAIR_S,
+        ):
+            return
+        ir.async_create_issue(
+            self.hass,
+            DOMAIN,
+            unreachable_issue_id(self.address),
+            is_fixable=False,
+            is_persistent=True,
+            learn_more_url=(
+                "https://github.com/gwaterhouse/holman-igardener-ha#troubleshooting"
+            ),
+            severity=ir.IssueSeverity.ERROR,
+            translation_key="unreachable",
+            translation_placeholders={"address": self.address},
+        )
+        self._repair_open = True
+        _LOGGER.error(
+            "Holman %s: unreachable for %.0f minutes. If it is not advertising, "
+            "power-cycle the controller. Raised repair %s.",
+            self.address,
+            UNREACHABLE_REPAIR_S / 60,
+            unreachable_issue_id(self.address),
+        )
+
+    def _clear_repair(self) -> None:
+        """Drop the repair even if this process did not create it.
+
+        The issue is persistent, so a restart must clear it on the next
+        successful link and not only when the in-memory flag is set.
+        """
+        self._repair_open = False
+        ir.async_delete_issue(self.hass, DOMAIN, unreachable_issue_id(self.address))
+
+    async def _send(self, command_frames: list[bytes]) -> None:
+        if self._stopping:
+            raise RuntimeError(f"{self.address}: integration is stopping")
+        client = self._live_client()
+        if client is None:
+            if self._client is not None:
+                await self._abandon(self._client)
+            if self._ready_in() > 0:
+                raise RuntimeError(
+                    f"{self.address}: not connected; next attempt in "
+                    f"{self._ready_in():.0f}s"
+                )
+            self._mark_wanted()
+            try:
+                client = await self._open()
+            except AttemptDeferred as exc:
+                raise RuntimeError(str(exc)) from exc
+            except Exception as exc:
+                if not self._stopping:
+                    self._note_failure(exc)
+                raise
             if PERSISTENT:
                 self._client = client
+                self._note_success()
+        dropped = False
         try:
             for frame in command_frames:
-                _LOGGER.debug("Holman write %s -> %s", WRITE_UUID, frame.hex())
-                await client.write_gatt_char(WRITE_UUID, frame, response=True)
-        except Exception:
-            # stale link: drop it; next command (or advert) reconnects
-            self._client = None
-            await self._safe_disconnect(client)
+                await self._write(client, frame)
+        except Exception as exc:
+            dropped = True
+            await self._abandon(client)
+            if PERSISTENT and not self._stopping:
+                self._note_failure(exc)
             raise
         finally:
-            if not PERSISTENT:
-                await self._safe_disconnect(client)
+            if not PERSISTENT and not dropped:
+                await self._disconnect_client(client)
+
+    def _spawn(self, coro, suffix: str):
+        name = f"holman_{suffix}_{self.address}"
+        create = getattr(self.hass, "async_create_background_task", None)
+        if create is None:
+            return self.hass.async_create_task(coro)
+        return create(coro, name=name)
 
     # ---- persistent-link maintenance ----
     def async_start(self) -> None:
         """Called from async_setup_entry when PERSISTENT."""
-        if not PERSISTENT:
+        if not PERSISTENT or self._stopping:
             return
         self._unsub_adv = async_register_callback(
             self.hass, self._on_advert,
             BluetoothCallbackMatcher(address=self.address, connectable=True),
             BluetoothScanningMode.ACTIVE,
         )
-        self._keepalive_task = self.hass.async_create_background_task(
-            self._keepalive_loop(), f"holman_keepalive_{self.address}")
+        self._unsub_stop = self.hass.bus.async_listen_once(
+            EVENT_HOMEASSISTANT_STOP, self._on_ha_stop,
+        )
+        self._keepalive_task = self._spawn(self._keepalive_loop(), "keepalive")
+        self._watchdog_task = self._spawn(self._watchdog_loop(), "watchdog")
+        self._schedule_reconnect()
 
-    def _on_advert(self, _si, _change: BluetoothChange) -> None:
-        # Controller is advertising = no link. Grab it while it's awake.
-        if self._client is None and not self._lock.locked() \
-                and time.monotonic() >= self._fail_until:
-            self.hass.async_create_task(self._reconnect())
+    async def _on_ha_stop(self, _event) -> None:
+        await self.async_stop()
+
+    def _on_advert(self, service_info, _change: BluetoothChange) -> None:
+        # One task owns reconnects. A cached advert at startup must not
+        # start a connect, and a stream of adverts must not start more.
+        if self._stopping:
+            return
+        client = self._live_client()
+        if client is not None and self._link_up_at is not None:
+            adv_time = self._advert_time(service_info)
+            if adv_time > self._link_up_at + STALE_ADV_GRACE_S:
+                self._schedule_stale_drop()
+            return
+        self._schedule_reconnect()
+
+    def _schedule_reconnect(self) -> None:
+        if self._stopping:
+            return
+        task = self._reconnect_task
+        if task is not None and not task.done():
+            return
+        delay = self._ready_in()
+        _LOGGER.info(
+            "Holman %s: connection attempt scheduled in %.0fs",
+            self.address, delay,
+        )
+        self._reconnect_task = self._spawn(self._reconnect(), "reconnect")
+
+    def _schedule_stale_drop(self) -> None:
+        if self._stopping:
+            return
+        task = self._stale_task
+        if task is not None and not task.done():
+            return
+        self._stale_task = self._spawn(self._drop_stale(), "stale")
+
+    async def _drop_stale(self) -> None:
+        _LOGGER.warning(
+            "Holman %s: advertisement while connected; dropping the stale link",
+            self.address,
+        )
+        async with self._lock:
+            if self._stopping:
+                return
+            client = self._client
+            self._client = None
+        await self._disconnect_client(client)
+        await self._release_proxy_slot()
+        if self._stopping:
+            return
+        # The controller is advertising now. Retry promptly; a failure
+        # still takes the normal backoff.
+        self._fail_until = min(self._fail_until, time.monotonic())
+        self._mark_wanted()
+        self._schedule_reconnect()
 
     async def _reconnect(self) -> None:
-        async with self._lock:
-            if self._client is not None and self._client.is_connected:
-                return
-            try:
-                self._client = await self._open()
-            except Exception as exc:
-                _LOGGER.debug("Holman %s: background reconnect failed: %s",
-                              self.address, exc)
+        try:
+            while not self._stopping:
+                delay = self._ready_in()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                    continue
+                async with self._lock:
+                    if self._stopping:
+                        return
+                    if self._live_client() is not None:
+                        return
+                    self._mark_wanted()
+                    try:
+                        client = await self._open()
+                    except AttemptDeferred:
+                        pass
+                    except Exception as exc:
+                        self._note_failure(exc)
+                        continue
+                    else:
+                        if self._stopping:
+                            await self._abandon(client)
+                            return
+                        self._client = client
+                        self._note_success()
+                        return
+                await asyncio.sleep(RECONNECT_SOON_S)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOGGER.exception("Holman %s: reconnect loop crashed", self.address)
 
     async def _keepalive_loop(self) -> None:
-        while True:
+        while not self._stopping:
             await asyncio.sleep(KEEPALIVE_S)
+            if self._stopping:
+                return
             async with self._lock:
-                c = self._client
-                if c is None or not c.is_connected:
+                if self._stopping:
+                    return
+                client = self._live_client()
+                if client is None:
                     continue
                 try:
-                    await c.write_gatt_char(WRITE_UUID, set_time_frame(dt_util.now()),
-                                            response=True)
+                    await self._write(client, set_time_frame(dt_util.now()))
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc:
-                    _LOGGER.debug("Holman %s: keepalive failed: %s", self.address, exc)
-                    self._client = None
-                    await self._safe_disconnect(c)
+                    await self._abandon(client)
+                    if not self._stopping:
+                        self._reconnect_soon(f"keepalive failed: {exc}")
+
+    async def _watchdog_loop(self) -> None:
+        while not self._stopping:
+            await asyncio.sleep(WATCHDOG_INTERVAL_S)
+            if self._stopping:
+                return
+            self._maybe_raise_repair()
+            if self._live_client() is None:
+                self._schedule_reconnect()
+
+    async def _cancel_task(self, task) -> None:
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            # A stuck Bluetooth call must not hold up shutdown. The task is
+            # cancelled; if it does not finish, it still sees _stopping.
+            await asyncio.wait_for(task, timeout=DISCONNECT_TIMEOUT_S)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                raise
+        except (TimeoutError, Exception):
+            _LOGGER.debug("Holman %s: background task ended during stop", self.address)
 
     async def async_stop(self) -> None:
-        if getattr(self, "_unsub_adv", None):
-            self._unsub_adv()
-        if getattr(self, "_keepalive_task", None):
-            self._keepalive_task.cancel()
-        if self._client is not None:
-            await self._safe_disconnect(self._client)
-            self._client = None
+        """Disconnect and cancel retries. Safe to call from unload and HA stop."""
+        if self._stop_wait is not None:
+            await self._stop_wait.wait()
+            return
+        self._stopping = True
+        self._stop_wait = asyncio.Event()
+        try:
+            for attr in ("_unsub_stop", "_unsub_adv"):
+                unsub = getattr(self, attr, None)
+                if unsub is None:
+                    continue
+                setattr(self, attr, None)
+                try:
+                    unsub()
+                except Exception as exc:
+                    _LOGGER.debug("Holman %s: unsubscribe failed: %s", self.address, exc)
+            tasks = (
+                self._keepalive_task,
+                self._watchdog_task,
+                self._reconnect_task,
+                self._stale_task,
+            )
+            for task in tasks:
+                if task is not None and not task.done():
+                    task.cancel()
+            for task in tasks:
+                await self._cancel_task(task)
+            try:
+                await asyncio.wait_for(self._lock.acquire(), DISCONNECT_TIMEOUT_S)
+            except TimeoutError:
+                _LOGGER.warning(
+                    "Holman %s: timed out waiting to stop; disconnecting anyway",
+                    self.address,
+                )
+                client = self._client
+                self._client = None
+            else:
+                try:
+                    client = self._client
+                    self._client = None
+                finally:
+                    self._lock.release()
+            await self._disconnect_client(client)
+            _LOGGER.info("Holman %s: disconnected", self.address)
+        finally:
+            self._stop_wait.set()
 
     async def turn_on(self, rgb=None, level=None):
         if rgb is not None:

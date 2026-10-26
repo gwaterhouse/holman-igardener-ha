@@ -47,5 +47,6 @@ is not the same as off.
 5. Write control/off frames as required.
 
 The controller only advertises briefly after power-on or after a disconnect,
-so the integration keeps the link open, writes a `0x24` frame every 240 s as a
-keepalive and reconnects when it sees a new advertisement.
+and the protocol has no close command. The integration keeps the link open,
+writes a `0x24` frame every 240 s as a keepalive, disconnects the Bluetooth
+client on shutdown, and reconnects with a startup delay and backoff.

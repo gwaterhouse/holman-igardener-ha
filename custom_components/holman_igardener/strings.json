@@ -18,5 +18,11 @@
       "already_configured": "Device is already configured",
       "no_devices_found": "No Vibrance_RGB controllers found. Power-cycle the controller (it only advertises briefly) and make sure the phone app is disconnected."
     }
+  },
+  "issues": {
+    "unreachable": {
+      "title": "Holman controller {address} is not responding",
+      "description": "The Vibrance_RGB controller at {address} has been unreachable for about 15 minutes. Home Assistant keeps trying in the background. If the controller is Bluetooth-silent and has stopped advertising, only a power-cycle will recover it: turn it off, wait 10 seconds, and turn it on. This alert clears when the link comes back."
+    }
   }
 }

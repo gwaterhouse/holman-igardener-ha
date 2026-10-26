@@ -3,3 +3,4 @@ __pycache__/
 *.log
 *.btsnoop
 *.cfa
+.pytest_cache/
