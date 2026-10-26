@@ -103,9 +103,16 @@ both can see the controller.
   While Home Assistant holds the connection the phone app cannot connect, and
   vice versa.
 - **Persistent connection:** the controller only advertises briefly after
-  power-on or a disconnect, so the integration keeps the connection open,
-  sends a small keepalive (a time-sync frame) every 240 seconds and reconnects
-  automatically when the controller advertises again.
+  power-on or a disconnect, and the protocol has no disconnect command. The
+  integration keeps the connection open and sends a small keepalive (a
+  time-sync frame) every 240 seconds. On Home Assistant shutdown, or when the
+  config entry is reloaded, it waits for the Bluetooth client to disconnect
+  so the controller can advertise again. The first connection after startup
+  waits about 25 seconds. A dropped link is retried once a few seconds later.
+  Failed attempts then wait 30 seconds, 60 seconds, 120 seconds and 3 minutes.
+  Advertisements do not start extra connections. If the controller stays
+  unreachable for about 15 minutes, Home Assistant raises a repair issue that
+  asks for a power-cycle. The issue clears when the link returns.
 - **Assumed state:** the controller does not report its state, so the entity
   shows the last state Home Assistant set. Changes made in the phone app or by
   the controller's own schedules are not reflected.
@@ -131,7 +138,15 @@ details. These notes were written from our own observations of BLE traffic.
   range.
 - **Connect fails repeatedly:** your local adapter may not be able to connect;
   add an ESPHome Bluetooth proxy near the controller. After a failed attempt
-  the integration waits about 20 seconds before trying again.
+  the integration backs off (30 seconds, then 60, 120 and 180) before trying
+  again. It does not open a new connection for every advertisement.
+- **Controller silent after a Home Assistant restart:** shutdown disconnects
+  the Bluetooth client and startup waits before connecting, so a restart is
+  less likely to leave the controller wedged. If the firmware has hung and
+  stopped advertising, no reconnect can wake it. After about 15 minutes a
+  repair under **Settings → System → Repairs** asks you to power-cycle the
+  controller. That is the recovery when it is Bluetooth-silent. The alert
+  clears once the link is back.
 - **Phone app can't connect:** expected while Home Assistant holds the
   connection. Disable the config entry temporarily to use the app.
 - **Debug logging:**
