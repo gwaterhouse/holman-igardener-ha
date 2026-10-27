@@ -22,7 +22,7 @@
   "issues": {
     "unreachable": {
       "title": "Holman controller {address} is not responding",
-      "description": "The Vibrance_RGB controller at {address} has been unreachable for about 15 minutes. Home Assistant keeps trying in the background. If the controller is Bluetooth-silent and has stopped advertising, only a power-cycle will recover it: turn it off, wait 10 seconds, and turn it on. This alert clears when the link comes back."
+      "description": "The Vibrance_RGB controller at {address} has been unreachable for about 15 minutes. Home Assistant marks the light unavailable after about 5 minutes and keeps trying in the background. If the controller is Bluetooth-silent and has stopped advertising, only a power-cycle will recover it: turn it off, wait 10 seconds, and turn it on. This alert clears when the link comes back."
     }
   }
 }

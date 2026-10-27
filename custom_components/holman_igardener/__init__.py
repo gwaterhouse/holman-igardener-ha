@@ -8,7 +8,7 @@ from .device import HolmanDevice
 from .const import CONF_FULL_INIT, DOMAIN
 from .recovery import unreachable_issue_id
 
-PLATFORMS = [Platform.LIGHT]
+PLATFORMS = [Platform.LIGHT, Platform.BINARY_SENSOR]
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     device = HolmanDevice(hass, entry.data[CONF_ADDRESS],

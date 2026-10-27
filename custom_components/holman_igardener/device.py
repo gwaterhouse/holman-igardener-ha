@@ -9,12 +9,15 @@ One reconnect task owns retries. The first attempt waits out the startup
 delay. A dropped link is retried once, shortly after. Failed attempts then
 wait 30s, 60s, 120s and 180s. Advertisements do not start extra connects.
 If the controller stays unreachable, a repair issue asks for a power-cycle.
+The same outage clock marks the light unavailable after 5 minutes, so a
+restart or a short proxy blip does not. The next successful link clears it.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import time
+from collections.abc import Callable
 
 from homeassistant.components.bluetooth import (
     BluetoothScanningMode,
@@ -56,12 +59,14 @@ from .recovery import (
     RECONNECT_SOON_S,
     STALE_ADV_GRACE_S,
     STARTUP_DELAY_S,
+    UNAVAILABLE_AFTER_S,
     UNREACHABLE_REPAIR_S,
     WATCHDOG_INTERVAL_S,
     AttemptDeferred,
     backoff_seconds,
     ready_in,
     repair_due,
+    unavailable_due,
     unreachable_issue_id,
 )
 
@@ -110,6 +115,9 @@ class HolmanDevice:
         self._disconnecting: set[int] = set()
         self._unsub_adv = None
         self._unsub_stop = None
+        # Latched so a restart stays available until failures last the window.
+        self._reachable = True
+        self._listeners: list[Callable[[], None]] = []
 
     def _notify(self, _char, data: bytearray) -> None:
         raw = bytes(data)
@@ -491,6 +499,68 @@ class HolmanDevice:
         await self._close_local(client)
         await self._release_proxy_slot()
 
+    @property
+    def reachable(self) -> bool:
+        """False only after reconnect/keepalive failures last the sustained window."""
+        return self._reachable
+
+    def add_listener(self, listener: Callable[[], None]) -> Callable[[], None]:
+        """Register an entity callback. Returns an unsubscribe function."""
+        self._listeners.append(listener)
+
+        def _remove() -> None:
+            try:
+                self._listeners.remove(listener)
+            except ValueError:
+                return
+
+        return _remove
+
+    def _notify_listeners(self) -> None:
+        for listener in list(self._listeners):
+            try:
+                listener()
+            except Exception:
+                _LOGGER.exception(
+                    "Holman %s: failed to push state to an entity", self.address
+                )
+
+    def _update_availability(self) -> None:
+        """Latch reachability. One warning when it drops, one info line when it returns.
+
+        wanted_since is unset until the first real attempt or a dropped link,
+        so the startup delay is not an outage. A live client is reachable.
+        """
+        if self._stopping:
+            return
+        reachable = not unavailable_due(
+            time.monotonic(),
+            self._wanted_since,
+            self._live_client() is not None,
+            after=UNAVAILABLE_AFTER_S,
+        )
+        if reachable == self._reachable:
+            return
+        self._reachable = reachable
+        if reachable:
+            _LOGGER.info(
+                "Holman %s: communication restored; marking the light available",
+                self.address,
+            )
+        else:
+            elapsed = (
+                0.0
+                if self._wanted_since is None
+                else time.monotonic() - self._wanted_since
+            )
+            _LOGGER.warning(
+                "Holman %s: no successful communication for %.0fs; "
+                "marking the light unavailable",
+                self.address,
+                elapsed,
+            )
+        self._notify_listeners()
+
     def _note_failure(self, exc: BaseException) -> None:
         self._failure_count += 1
         wait = backoff_seconds(self._failure_count)
@@ -502,6 +572,7 @@ class HolmanDevice:
         )
         self._maybe_raise_repair()
         self._schedule_reconnect()
+        self._update_availability()
 
     def _note_success(self) -> None:
         failed = self._failure_count
@@ -522,6 +593,7 @@ class HolmanDevice:
             )
         else:
             _LOGGER.info("Holman %s: link up", self.address)
+        self._update_availability()
 
     def _reconnect_soon(self, reason: str) -> None:
         if self._stopping:
@@ -533,6 +605,7 @@ class HolmanDevice:
         self._fail_until = time.monotonic() + RECONNECT_SOON_S
         self._mark_wanted()
         self._schedule_reconnect()
+        self._update_availability()
 
     def _maybe_raise_repair(self) -> None:
         if self._stopping or self._repair_open:
@@ -772,6 +845,8 @@ class HolmanDevice:
                     return
                 client = self._live_client()
                 if client is None:
+                    # A missing client is the reconnect loop's job. This probe
+                    # only notices a link that still looks open.
                     continue
                 try:
                     await self._write(client, set_time_frame(dt_util.now()))
@@ -791,6 +866,7 @@ class HolmanDevice:
             await asyncio.sleep(WATCHDOG_INTERVAL_S)
             if self._stopping:
                 return
+            self._update_availability()
             self._maybe_raise_repair()
             if self._live_client() is None:
                 self._schedule_reconnect()
