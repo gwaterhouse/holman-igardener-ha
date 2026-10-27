@@ -15,6 +15,13 @@ RECONNECT_SOON_S = 3.0
 # Repeated failures must not speed up just because advertisements continue.
 BACKOFF_STEPS_S = (30.0, 60.0, 120.0, 180.0)
 UNREACHABLE_REPAIR_S = 15 * 60.0
+# How long reconnect/keepalive failures must continue before the light is
+# marked unavailable. The clock is wanted_since, same as the repair: it
+# starts when a held link drops or the first connect attempt begins, and
+# it stays unset through the startup delay. Five minutes rides through a
+# brief proxy blip (reconnect is a few seconds, then 30/60/120/180s
+# backoff) and is still well inside the 15-minute power-cycle repair.
+UNAVAILABLE_AFTER_S = 5 * 60.0
 GATT_OP_TIMEOUT_S = 20.0
 DISCONNECT_TIMEOUT_S = 10.0
 # After this long, do not use the client establish_connection returns.
@@ -60,6 +67,22 @@ def repair_due(
     if connected or wanted_since is None:
         return False
     return (now - wanted_since) >= after
+
+
+def unavailable_due(
+    now: float,
+    wanted_since: float | None,
+    connected: bool,
+    *,
+    after: float = UNAVAILABLE_AFTER_S,
+) -> bool:
+    """True when the link we want has been down long enough to mark the light unavailable.
+
+    Same clock as the repair issue, shorter window. A startup delay leaves
+    wanted_since unset, so that wait is not an outage. A live link is
+    reachable even if the clock has not been cleared yet.
+    """
+    return repair_due(now, wanted_since, connected, after=after)
 
 
 def unreachable_issue_id(address: str) -> str:

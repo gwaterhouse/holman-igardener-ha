@@ -1,6 +1,6 @@
 """Light platform for Holman iGardener RGB."""
 from __future__ import annotations
-from .const import DOMAIN
+from .const import DOMAIN, address_slug, device_info
 from homeassistant.components.light import LightEntity, ColorMode, ATTR_BRIGHTNESS, ATTR_RGB_COLOR
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -21,10 +21,12 @@ class HolmanLight(LightEntity):
 
     def __init__(self, device, address):
         self._device = device
-        self._attr_unique_id = address.replace(":", "").lower()
-        self._attr_device_info = {"identifiers": {(DOMAIN, self._attr_unique_id)},
-            "name": "Holman iGardener RGB", "manufacturer": "Holman",
-            "model": "iGardener RGB (Vibrance_RGB)", "connections": {("bluetooth", address)}}
+        self._attr_unique_id = address_slug(address)
+        self._attr_device_info = device_info(address)
+
+    @property
+    def available(self) -> bool:
+        return self._device.reachable
 
     @property
     def is_on(self): return self._device.on
@@ -32,6 +34,10 @@ class HolmanLight(LightEntity):
     def brightness(self): return self._device.level
     @property
     def rgb_color(self): return self._device.rgb
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self.async_on_remove(self._device.add_listener(self.async_write_ha_state))
 
     async def async_turn_on(self, **kwargs):
         rgb = kwargs.get(ATTR_RGB_COLOR, self._device.rgb)

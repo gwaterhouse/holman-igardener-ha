@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from types import SimpleNamespace
 
@@ -226,6 +227,9 @@ def test_keepalive_failure_disconnects_and_backs_off(monkeypatch):
             assert client.disconnects == 1
             assert dev._client is None
             assert dev._failure_count == 0
+            # One keepalive miss starts the outage clock but is not yet an outage.
+            assert dev._wanted_since is not None
+            assert dev.reachable is True
             remaining = dev._fail_until - time.monotonic()
             assert 0 < remaining <= device_mod.RECONNECT_SOON_S
             assert device_mod.close_stale_connections_by_address.calls
@@ -251,6 +255,7 @@ def test_connect_failure_uses_growing_backoff():
             assert dev._failure_count == 2
             assert 59 <= dev._fail_until - time.monotonic() <= 60
             assert len(hass.tasks) == first_tasks == 1
+            assert dev.reachable is True
             assert device_mod.establish_connection.calls == []
         finally:
             await dev.async_stop()
@@ -962,3 +967,186 @@ def test_stop_during_command_write_disconnect_is_not_cancelled():
                 await dev.async_stop()
 
     asyncio.run(_body())
+
+
+def test_startup_before_the_first_attempt_is_not_unavailable(monkeypatch, caplog):
+    """The startup delay must not count, even if the window is zero."""
+    monkeypatch.setattr(device_mod, "STARTUP_DELAY_S", 1000)
+    monkeypatch.setattr(device_mod, "UNAVAILABLE_AFTER_S", 0)
+    monkeypatch.setattr(device_mod, "WATCHDOG_INTERVAL_S", 0.02)
+    caplog.set_level(logging.WARNING)
+
+    async def _body():
+        _hass, dev = _device()
+        try:
+            dev.async_start()
+            await asyncio.sleep(0.12)
+            assert dev._wanted_since is None
+            assert dev.reachable is True
+            assert device_mod.establish_connection.calls == []
+        finally:
+            await dev.async_stop()
+
+    asyncio.run(_body())
+    assert "marking the light unavailable" not in caplog.text
+
+
+def test_short_outage_stays_reachable(caplog):
+    caplog.set_level(logging.WARNING)
+
+    async def _body():
+        _hass, dev = _device()
+        try:
+            dev._mark_wanted()
+            dev._update_availability()
+            assert dev.reachable is True
+            dev._reconnect_soon("link dropped")
+            assert dev.reachable is True
+        finally:
+            await dev.async_stop()
+
+    asyncio.run(_body())
+    assert "marking the light unavailable" not in caplog.text
+
+
+def test_first_connect_does_not_log_restored(caplog):
+    caplog.set_level(logging.INFO)
+
+    async def _body():
+        _hass, dev = _device()
+        try:
+            dev._note_success()
+            assert dev.reachable is True
+        finally:
+            await dev.async_stop()
+
+    asyncio.run(_body())
+    assert "link up" in caplog.text
+    assert "communication restored" not in caplog.text
+
+
+def test_sustained_outage_marks_unavailable_and_recovery_clears_it(caplog):
+    caplog.set_level(logging.INFO)
+
+    async def _body():
+        hass, dev = _device()
+        seen = []
+        dev.add_listener(lambda: seen.append(dev.reachable))
+        try:
+            dev._note_failure(RuntimeError("no advertisement"))
+            assert dev.reachable is True
+            assert seen == []
+            dev._wanted_since = time.monotonic() - device_mod.UNAVAILABLE_AFTER_S - 1
+            dev._update_availability()
+            assert dev.reachable is False
+            assert seen == [False]
+            # Retries keep running after the light is marked unavailable.
+            assert any(not task.done() for task in hass.tasks)
+            dev._update_availability()
+            assert seen == [False]
+            dev._client = FakeClient()
+            dev._note_success()
+            assert dev.reachable is True
+            assert dev._wanted_since is None
+            assert seen == [False, True]
+        finally:
+            await dev.async_stop()
+
+    asyncio.run(_body())
+    assert "marking the light unavailable" in caplog.text
+    assert "communication restored; marking the light available" in caplog.text
+    # The transition is logged once, not on every later check.
+    assert caplog.text.count("marking the light unavailable") == 1
+    assert caplog.text.count("communication restored") == 1
+
+
+def test_watchdog_marks_unavailable_after_the_window(monkeypatch, caplog):
+    monkeypatch.setattr(device_mod, "STARTUP_DELAY_S", 1000)
+    monkeypatch.setattr(device_mod, "UNAVAILABLE_AFTER_S", 0.05)
+    monkeypatch.setattr(device_mod, "WATCHDOG_INTERVAL_S", 0.02)
+    caplog.set_level(logging.INFO)
+
+    async def _body():
+        _hass, dev = _device()
+        dev._wanted_since = time.monotonic()
+        try:
+            dev.async_start()
+            for _ in range(40):
+                if not dev.reachable:
+                    break
+                await asyncio.sleep(0.02)
+            assert dev.reachable is False
+            dev._note_success()
+            assert dev.reachable is True
+            assert dev._wanted_since is None
+        finally:
+            await dev.async_stop()
+
+    asyncio.run(_body())
+    assert "marking the light unavailable" in caplog.text
+    assert "communication restored; marking the light available" in caplog.text
+
+
+def test_live_link_is_reachable_even_if_the_clock_is_old():
+    async def _body():
+        _hass, dev = _device()
+        try:
+            dev._client = FakeClient()
+            dev._wanted_since = time.monotonic() - device_mod.UNAVAILABLE_AFTER_S - 5
+            dev._reachable = False
+            dev._update_availability()
+            assert dev.reachable is True
+        finally:
+            await dev.async_stop()
+
+    asyncio.run(_body())
+
+
+def test_light_and_connectivity_follow_the_same_latch():
+    async def _body():
+        _hass, dev = _device()
+        from custom_components.holman_igardener.binary_sensor import HolmanConnectivity
+        from custom_components.holman_igardener.light import HolmanLight
+
+        light = HolmanLight(dev, ADDRESS)
+        sensor = HolmanConnectivity(dev, ADDRESS)
+        await light.async_added_to_hass()
+        await sensor.async_added_to_hass()
+        try:
+            assert light.unique_id == "c56ad4a14a88"
+            assert light.name == "Holman iGardener RGB"
+            assert sensor.unique_id == "c56ad4a14a88_connectivity"
+            assert sensor.name == "Holman iGardener RGB Connectivity"
+            assert sensor.device_class == "connectivity"
+            assert sensor.entity_category == "diagnostic"
+            assert sensor.device_info["identifiers"] == light.device_info["identifiers"]
+            assert sensor.device_info["identifiers"] == {
+                ("holman_igardener", "c56ad4a14a88")
+            }
+            assert light.available is True
+            assert sensor.is_on is True
+            assert sensor.available is True
+            dev._wanted_since = time.monotonic() - device_mod.UNAVAILABLE_AFTER_S - 1
+            dev._update_availability()
+            assert light.available is False
+            assert sensor.is_on is False
+            assert sensor.available is True
+            assert light.writes == 1
+            assert sensor.writes == 1
+            light._unsubs[0]()
+            dev._client = FakeClient()
+            dev._note_success()
+            assert light.available is True
+            assert sensor.is_on is True
+            assert light.writes == 1
+            assert sensor.writes == 2
+        finally:
+            await dev.async_stop()
+
+    asyncio.run(_body())
+
+
+def test_platforms_include_the_connectivity_sensor():
+    from custom_components.holman_igardener import PLATFORMS
+
+    assert PLATFORMS == ["light", "binary_sensor"]

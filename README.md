@@ -4,7 +4,10 @@ A custom Home Assistant integration that controls Holman iGardener RGB garden
 light controllers (which advertise over Bluetooth LE as `Vibrance_RGB`)
 locally, with no cloud and no phone app.
 
-It provides a single `light` entity with on/off, RGB colour and brightness.
+It provides a `light` entity with on/off, RGB colour and brightness. If the
+controller stops answering for several minutes, that light becomes
+unavailable so automations can see the outage. A diagnostic connectivity
+sensor on the same device reports the same reachability.
 
 > **Disclaimer:** This project is an independent, community-made integration.
 > It is not affiliated with, endorsed by, or supported by Holman Industries.
@@ -113,9 +116,27 @@ both can see the controller.
   Advertisements do not start extra connections. If the controller stays
   unreachable for about 15 minutes, Home Assistant raises a repair issue that
   asks for a power-cycle. The issue clears when the link returns.
-- **Assumed state:** the controller does not report its state, so the entity
-  shows the last state Home Assistant set. Changes made in the phone app or by
-  the controller's own schedules are not reflected.
+- **Unavailable when it is really down:** the same outage clock starts when
+  a held link drops or the first connection attempt begins. It does not
+  start during the startup delay, so a restart does not flash the light
+  unavailable. If reconnect and keepalive attempts then keep failing for
+  5 minutes (`UNAVAILABLE_AFTER_S` in
+  `custom_components/holman_igardener/recovery.py`), the light becomes
+  unavailable and a warning is logged. The next successful connection marks
+  it available again and logs an info line. A short proxy blip recovers
+  inside that window. Retries continue either way. A link that still looks
+  open is only checked by the 240-second keepalive, so that is how soon a
+  hung-but-still-connected controller can start the clock.
+- **Connectivity sensor:** diagnostic binary sensor
+  `binary_sensor.holman_igardener_rgb_connectivity` (unique id is the
+  controller address without colons, plus `_connectivity`). It stays
+  available. It is on while the light is available, including startup and
+  short drops, and off when the light is unavailable.
+- **Assumed state:** the controller does not report its state, so while the
+  light is available it shows the last state Home Assistant set. Changes
+  made in the phone app or by the controller's own schedules are not
+  reflected. Coming back from unavailable shows that last commanded state
+  again; it is not a fresh read from the controller.
 - **Colours** may not exactly match what the phone app shows for the same
   setting.
 - Only plain colour/brightness/on/off is supported; scenes, effects and
@@ -143,10 +164,17 @@ details. These notes were written from our own observations of BLE traffic.
 - **Controller silent after a Home Assistant restart:** shutdown disconnects
   the Bluetooth client and startup waits before connecting, so a restart is
   less likely to leave the controller wedged. If the firmware has hung and
-  stopped advertising, no reconnect can wake it. After about 15 minutes a
-  repair under **Settings → System → Repairs** asks you to power-cycle the
-  controller. That is the recovery when it is Bluetooth-silent. The alert
-  clears once the link is back.
+  stopped advertising, no reconnect can wake it. The light stays available
+  through startup. After attempts have been failing for about 5 minutes the
+  light becomes unavailable (log: `marking the light unavailable`) and the
+  connectivity sensor turns off. After about 15 minutes a repair under
+  **Settings → System → Repairs** asks you to power-cycle the controller.
+  That is the recovery when it is Bluetooth-silent. Once the link is back
+  the light becomes available, the connectivity sensor turns on, and the
+  repair clears.
+- **Light stuck on the last on/off state:** that is assumed state, until the
+  5-minute window above. A GATT write that still succeeds does not count as
+  a failure; this controller never reports light state back.
 - **Phone app can't connect:** expected while Home Assistant holds the
   connection. Disable the config entry temporarily to use the app.
 - **Debug logging:**
@@ -160,6 +188,10 @@ details. These notes were written from our own observations of BLE traffic.
 
   Debug logs include the frames written and notifications received. Logs will
   contain your device's Bluetooth address – redact it before sharing.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

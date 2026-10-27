@@ -37,9 +37,65 @@ _pkg("homeassistant.helpers")
 _pkg("homeassistant.util")
 
 const = _mod("homeassistant.const")
-const.Platform = type("Platform", (), {"LIGHT": "light"})
+const.Platform = type(
+    "Platform", (), {"LIGHT": "light", "BINARY_SENSOR": "binary_sensor"}
+)
 const.CONF_ADDRESS = "address"
 const.EVENT_HOMEASSISTANT_STOP = "homeassistant_stop"
+const.EntityCategory = type("EntityCategory", (), {"DIAGNOSTIC": "diagnostic"})
+
+
+class _Entity:
+    """Enough of homeassistant.helpers.entity.Entity for these tests."""
+
+    def async_on_remove(self, callback):
+        self._unsubs = getattr(self, "_unsubs", [])
+        self._unsubs.append(callback)
+
+    async def async_added_to_hass(self):
+        return None
+
+    def async_write_ha_state(self):
+        self.writes = getattr(self, "writes", 0) + 1
+
+    @property
+    def name(self):
+        return getattr(self, "_attr_name", None)
+
+    @property
+    def unique_id(self):
+        return getattr(self, "_attr_unique_id", None)
+
+    @property
+    def device_class(self):
+        return getattr(self, "_attr_device_class", None)
+
+    @property
+    def entity_category(self):
+        return getattr(self, "_attr_entity_category", None)
+
+    @property
+    def device_info(self):
+        return getattr(self, "_attr_device_info", None)
+
+
+entity_platform = _mod("homeassistant.helpers.entity_platform")
+entity_platform.AddEntitiesCallback = object
+
+exceptions = _mod("homeassistant.exceptions")
+exceptions.HomeAssistantError = type("HomeAssistantError", (Exception,), {})
+
+light = _mod("homeassistant.components.light")
+light.ColorMode = type("ColorMode", (), {"RGB": "rgb"})
+light.ATTR_BRIGHTNESS = "brightness"
+light.ATTR_RGB_COLOR = "rgb_color"
+light.LightEntity = type("LightEntity", (_Entity,), {})
+
+binary_sensor = _mod("homeassistant.components.binary_sensor")
+binary_sensor.BinarySensorDeviceClass = type(
+    "BinarySensorDeviceClass", (), {"CONNECTIVITY": "connectivity"}
+)
+binary_sensor.BinarySensorEntity = type("BinarySensorEntity", (_Entity,), {})
 
 core = _mod("homeassistant.core")
 core.HomeAssistant = type("HomeAssistant", (), {})

@@ -6,10 +6,12 @@ from pathlib import Path
 
 from custom_components.holman_igardener.recovery import (
     BACKOFF_STEPS_S,
+    UNAVAILABLE_AFTER_S,
     UNREACHABLE_REPAIR_S,
     backoff_seconds,
     ready_in,
     repair_due,
+    unavailable_due,
     unreachable_issue_id,
 )
 
@@ -39,6 +41,27 @@ def test_repair_due_only_after_the_outage_window():
     assert repair_due(49, 0, False, after=50) is False
 
 
+def test_unavailable_due_is_the_shorter_window():
+    assert UNAVAILABLE_AFTER_S == 5 * 60
+    assert max(BACKOFF_STEPS_S) < UNAVAILABLE_AFTER_S < UNREACHABLE_REPAIR_S
+    assert unavailable_due(1000, None, False) is False
+    assert unavailable_due(1000, 0, True) is False
+    assert unavailable_due(1000, 1000 - UNAVAILABLE_AFTER_S + 1, False) is False
+    assert unavailable_due(1000, 1000 - UNAVAILABLE_AFTER_S, False) is True
+    # A live link is reachable even if the clock was not cleared.
+    assert unavailable_due(1000, 0, True, after=1) is False
+    assert unavailable_due(1000, 900, False, after=50) is True
+    assert unavailable_due(1000, 960, False, after=50) is False
+
+
+def test_manifest_version():
+    manifest = json.loads(
+        (ROOT / "custom_components/holman_igardener/manifest.json").read_text()
+    )
+    assert manifest["version"] == "0.3.0"
+    assert manifest["domain"] == "holman_igardener"
+
+
 def test_issue_id_strips_colons():
     assert unreachable_issue_id("C5:6A:D4:A1:4A:88") == "unreachable_c56ad4a14a88"
 
@@ -55,3 +78,4 @@ def test_issue_strings_match_and_name_the_power_cycle():
     assert "{address}" in issue["title"]
     assert "{address}" in issue["description"]
     assert "power-cycle" in issue["description"]
+    assert "unavailable" in issue["description"]
